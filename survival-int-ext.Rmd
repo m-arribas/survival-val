@@ -1,0 +1,565 @@
+# Script to develop  multi-variable prediction model for time-to-event outcomes using
+# an internal-external validation framework
+# performance metrics include C-index, calibration slope, calibration-in-the-large, Brier score and 
+# decision curve analysis
+
+# No data sharing is allowed, so the script generates a simulated dataset 
+
+rm(list=ls())
+
+##
+### Load all relevant packages
+```{r}
+library(tidyverse)
+library(survival)
+library(dplyr)
+library(mice)
+library(caret)
+library(ggsurvfit)
+library(ggplot2)
+library(survminer)
+library(glmnet)
+library(dcurves)
+library(pec)
+library(rms)
+
+```
+
+##
+### Define categorical and  numerical variables
+```{r}
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Number of observations
+n <- 1000
+
+# Define categorical variables
+cat_vars <- c("Gender_ID", "ethnicitycleaned", "borough_of_residence", "index_diagnosis",
+              "AD_across_rows_6mo", "ANX_across_rows_6mo", "MS_count", "AP_count")
+
+# Define continuous variables
+cont_vars <- c("event_merged", "time_to_event", "new_age", "total_length_mh", "total_length_nmh",
+               "Positive_symptom_score", "Negative_symptom_score", "Depressive_symptom_score", 
+               "Manic_symptom_score", "Disorganised_symptom_score", "Catatonic_symptom_score", 
+               "Other_symptoms", "Substance_score")
+
+# Generate simulated data
+result <- data.frame(
+  brcid_a = sprintf("BRCID-%04d", 1:n),  # Create unique alphanumeric ID codes
+  Gender_ID = sample(c("Male", "Female", "Other"), n, replace = TRUE),
+  ethnicitycleaned = sample(c("White", "Black", "Asian", "Other"), n, replace = TRUE),
+  borough_of_residence = sample(c("Borough_A", "Borough_B", "Borough_C"), n, replace = TRUE),
+  index_diagnosis = sample(c("Diagnosis_A", "Diagnosis_B", "Diagnosis_C"), n, replace = TRUE),
+  AD_across_rows_6mo = sample(c("Yes", "No"), n, replace = TRUE),
+  ANX_across_rows_6mo = sample(c("Yes", "No"), n, replace = TRUE),
+  MS_count = sample(0:5, n, replace = TRUE),
+  AP_count = sample(0:5, n, replace = TRUE),
+  
+  event_merged = sample(c(0, 1, 2), n, replace = TRUE),  # Updated to take values 0, 1, or 2
+  time_to_event = runif(n, min = 1, max = 5000),
+  new_age = rnorm(n, mean = 40, sd = 10),
+  total_length_mh = rpois(n, lambda = 50),
+  total_length_nmh = rpois(n, lambda = 30),
+  Positive_symptom_score = rnorm(n, mean = 10, sd = 3),
+  Negative_symptom_score = rnorm(n, mean = 8, sd = 2.5),
+  Depressive_symptom_score = rnorm(n, mean = 12, sd = 4),
+  Manic_symptom_score = rnorm(n, mean = 9, sd = 3),
+  Disorganised_symptom_score = rnorm(n, mean = 7, sd = 2),
+  Catatonic_symptom_score = rnorm(n, mean = 5, sd = 1.5),
+  Other_symptoms = rnorm(n, mean = 6, sd = 2),
+  Substance_score = rpois(n, lambda = 3)
+)
+
+# Convert categorical variables to factors
+result[cat_vars] <- lapply(result[cat_vars], factor)
+
+# Convert continuous variables to numeric (ensures correct type)
+result[cont_vars] <- lapply(result[cont_vars], as.numeric)
+
+# Introduce missing values at random
+introduce_missingness <- function(data, vars_to_exclude, missing_prob) {
+  # Get all variable names except the ones to exclude
+  vars <- setdiff(names(data), vars_to_exclude)
+  
+  for (var in vars) {
+    missing_indices <- sample(1:nrow(data), size = round(missing_prob * nrow(data)), replace = FALSE)
+    data[missing_indices, var] <- NA
+  }
+  return(data)
+}
+
+# Variables to exclude from missingness
+vars_to_exclude <- c("event_merged", "time_to_event")
+
+# Define missingness probability
+missing_prob <- 0.1
+
+# Apply the function to the dataset
+result <- introduce_missingness(result, vars_to_exclude, missing_prob)
+
+# Inspect the dataset
+str(result)
+
+# View a sample of the data with missing values
+head(result)
+
+```
+
+##
+### Check missingness
+```{r}
+
+# Double check how much missing data there is for the predictors
+na_count <- sapply(result, function(x) sum(is.na(x)))
+na_count
+
+```
+
+##
+### Censor at 6 years 
+```{r}
+
+
+censoring_threshold <- 6 * 365  # 6 years in days
+result$cens <- ifelse(result$time_to_event > censoring_threshold, 1, 0)  # Censoring indicator
+result$cens_event <- ifelse(result$time_to_event > censoring_threshold, 0, as.character(result$event_merged))  # Censored event
+result$cens_time <- pmin(result$time_to_event, censoring_threshold)  # Censored time
+max(result$cens_time, na.rm = TRUE)
+
+```
+
+##
+### Merge sperate events 
+```{r}
+                   
+result$event_merged <- result$cens_event  %>% as.numeric() 
+result$event_merged <- ifelse(result$event_merged == 1 | result$event_merged == 2, 1, result$event_merged)
+result$time_to_event <- result$cens_time  %>% as.numeric() 
+result <- result %>% select(-cens_event, -cens_time, -cens)
+```
+
+
+##
+### Basic survival curve
+```{r}
+
+
+surv_obj <- Surv(time = result$time_to_event, event = result$event_merged) # Event should be numeric otherwise it assumes a multi-state model (e.g. competing risks)
+
+surv_fit <- survfit(surv_obj ~ 1)
+
+time_points <- c(0,365,2*265,3*365,4*365,5*365,6*365)
+surv_summary <- summary(surv_fit, times = time_points )
+
+summary_table <- data.frame( 
+    Time = time_points, 
+    Cumulative_Risk = signif(1 - surv_summary$surv, 3), 
+    Lower_CI = signif(1 - surv_summary$lower, 3), 
+    Upper_CI = signif(1 - surv_summary$upper, 3), 
+    Number_events =  signif(surv_summary$n.event, 3), 
+    Sample_size = signif(surv_summary$n.risk, 3)
+    )
+
+print(summary_table)
+
+#write.csv(summary_table, "survival_prob_joint.csv")
+
+```
+##
+### Plot cumulative risk
+```{r}
+
+# Convert the survfit object to a data frame
+surv_data <- data.frame(
+  time = surv_fit$time,
+  prob_event = 1 - surv_fit$surv,  # Complement of survival probability
+  lower = 1 - surv_fit$lower,      # Lower confidence interval
+  upper = 1 - surv_fit$upper       # Upper confidence interval
+)
+
+# Create the step plot with confidence intervals using ggplot
+ggplot(surv_data, aes(x = time, y = prob_event)) +
+theme_minimal() +
+  # Step plot for the event probability
+  geom_step(color = "black", size = 1) + 
+  
+  # Add the confidence interval as a ribbon (shaded area)
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "gray", alpha = 0.5, color = NA) +
+  
+  # Optional: Add step lines for the lower and upper confidence intervals
+  # geom_step(aes(y = lower), color = "blue", linetype = "dashed", size = 0.5) +  # Lower CI
+  # geom_step(aes(y = upper), color = "blue", linetype = "dashed", size = 0.5) +  # Upper CI
+  
+  # Labels and title
+  labs(x = "Time (days)", y = "Probability of Event Occurring", 
+       title = "") +
+
+ # Custom X-axis scale with breaks at intervals of 365 and labels matching those breaks
+  scale_x_continuous(breaks = seq(0, 2190, by = 365), labels = seq(0, 2190, by = 365)) +
+  
+  
+  # Y-axis scale between 0 and 1 for probabilities
+  scale_y_continuous(limits = c(0, 0.4), expand = c(0, 0)) +
+  
+  # Apply minimal theme for a clean look
+  theme_minimal() +
+  
+  # Customize text and title sizes
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+    axis.text = element_text(size = 17),
+    axis.title = element_text(size = 20)
+      
+  )
+
+```
+
+##
+### Build the final model first on all the available data
+```{r}
+
+# Imputation --------------
+
+# Remove event and time-to-event from imputation
+
+outcome <- result %>% select(c("time_to_event","event_merged"))
+
+result_no_outcome <- result %>% select(-c("brcid_a","time_to_event","event_merged"))
+all_vars <- colnames(result_no_outcome)
+set.seed(123)
+mice_imputes <- suppressMessages(mice(result_no_outcome, method = "rf", printFlag = FALSE)) # Mice with Random forest 
+
+# Check the summary 
+summary(mice_imputes)
+```
+
+
+##
+### Complete the imputed data
+```{r}
+
+imputed_data <- complete(mice_imputes)
+imputed_data <- cbind(imputed_data, outcome)
+
+head(imputed_data)
+
+sum(is.na(imputed_data$new_age))
+sum(is.na(imputed_data$Gender_ID))
+sum(is.na(imputed_data$ethnicitycleaned))
+
+```
+
+##
+### Now fit full model
+```{r}
+
+x_full <- imputed_data %>% select(all_of(all_vars))
+
+# Dummify the data
+dmy <- dummyVars(" ~ .", data = x_full, fullRank = TRUE)
+trsf_full <- data.frame(predict(dmy, newdata = x_full))
+x_full <- as.matrix(trsf_full)
+
+y_full <- Surv(imputed_data$time_to_event, imputed_data$event_merged)
+
+```
+
+```{r}
+# Fit the Lasso-Cox model on the full data
+
+final_model <- cv.glmnet(x_full, y_full, alpha=1, family="cox", type.measure = "C", nfolds = 5)
+
+# Extract the lambda values
+lambda_values <- final_model$lambda                   
+
+# Extract the C-index values (cv-means represent the performance)
+c_index_values <- final_model$cvm
+
+# Extract the standard errors for the C-index
+c_index_se <- final_model$cvsd
+
+# Plot the C-index values vs. lambda
+plot(lambda_values, 
+     c_index_values, 
+     type = "b",               # Line and point plot
+     log = "x",                # Plot lambda on a log scale
+     xlab = "Lambda (log scale)", 
+     ylab = "C-Index", 
+     main = "C-Index vs. Lambda",
+     col = "blue",             # Line color
+     lty = 1,                  # Line type
+     pch = 19)                 # Point type
+
+# Add error bars for the C-index (±1 standard error)
+arrows(lambda_values, 
+       c_index_values - c_index_se, 
+       lambda_values, 
+       c_index_values + c_index_se, 
+       length = 0.05, 
+       angle = 90, 
+       code = 3, 
+       col = "blue")
+
+# Add grid for better visualization
+grid()
+
+
+# Extract the lambda that gives the minimum cross-validation error (highest C-index)
+best_lambda_min <- final_model$lambda.min
+cat("Best lambda (lambda.min):", best_lambda_min, "\n")
+```
+
+
+```{r}
+# Extract the coefficients at the optimal lambda
+final_coefficients <- as.matrix(coef(final_model, s = "lambda.min")) %>% as.data.frame()
+
+# Add column for hazard ration (HR)
+final_coefficients$'1' <- as.numeric(final_coefficients$'1' ) %>% round(3)
+final_coefficients$HR <- exp(final_coefficients$'1' ) %>% round(3)
+colnames(final_coefficients) <- c("Coefficient", "HR")
+print(final_coefficients)
+
+#write.csv(final_coefficients, "final_coefficients.csv")
+
+```
+
+
+# Internal-external validation framework
+```{r}
+
+list_boroughs <- levels(result$borough_of_residence)
+print(list_boroughs)
+
+
+c_stat_app <- data.frame(C_Cox = rep(NA, length(list_boroughs)),
+                         SE_Cox = rep(NA, length(list_boroughs)),
+                         Val_borough = rep(NA, length(list_boroughs)),
+                         n_train = rep(NA, length(list_boroughs)),
+                         events_train = rep(NA, length(list_boroughs)),
+                         n_test = rep(NA, length(list_boroughs)),
+                         events_test = rep(NA, length(list_boroughs)))
+
+c_stat_ext <- data.frame(C_Cox = rep(NA, length(list_boroughs)),
+                         SE_Cox = rep(NA, length(list_boroughs)),
+                         Val_borough = rep(NA, length(list_boroughs)),
+                         n_train = rep(NA, length(list_boroughs)),
+                         events_train = rep(NA, length(list_boroughs)),
+                         n_test = rep(NA, length(list_boroughs)),
+                         events_test = rep(NA, length(list_boroughs)),
+                         cali_1 = rep(NA, length(list_boroughs)),
+                         cali_2 = rep(NA, length(list_boroughs)),
+                         brier = rep(NA, length(list_boroughs)))
+```
+
+```{r}
+for (i in 1:length(list_boroughs)) {
+ 
+borough <- list_boroughs[[i]] # need to repeat this n times for each borough 
+print(borough)
+
+# Split datasets by borough (leave one out for validation, remaining ones for dvlpt)
+
+train <- result %>% filter(borough_of_residence != borough)  
+test <- result %>% filter(borough_of_residence == borough)
+
+# Imputation seperately ------------------------------------------------------------------------------
+set.seed(123 + i)
+
+    # Remove event and time-to-event from imputation
+
+outcome_train <- train %>% select(c("time_to_event","event_merged"))
+train <- train %>% select(-c("time_to_event","event_merged"))
+    
+outcome_test <- test %>% select(c("time_to_event","event_merged"))
+test <- test %>% select(-c("time_to_event","event_merged"))
+
+    # imputation
+mice_imputes_train <- suppressMessages(
+  mice(train, method = "rf", printFlag = FALSE)) # Mice with Random forest 
+train <- complete(mice_imputes_train)
+
+mice_imputes_test <- suppressMessages(
+  mice(test, method = "rf", printFlag = FALSE)) # Mice with Random forest 
+test <- complete(mice_imputes_test)
+
+        # merge outcomes after imputation
+train <- cbind(train, outcome_train)
+train$time_to_event <- as.numeric(train$time_to_event)
+train$event_merged <- as.numeric(train$event_merged)
+
+test <- cbind(test, outcome_test)
+test$time_to_event <- as.numeric(test$time_to_event)
+test$event_merged <- as.numeric(test$event_merged)
+
+    # Add interaction term to the data
+train$num_gender <- as.numeric(train$Gender_ID)
+train$age_gender_interaction <- train$new_age * train$num_gender
+
+test$num_gender <- as.numeric(test$Gender_ID)
+test$age_gender_interaction <- test$new_age * test$num_gender
+
+# Inner fold CV --------------------------------------------------------------------------
+
+  # Prepare the training data for modeling
+  x <- train %>% select(all_of(all_vars))
+  # dummify the data
+  dmy <- dummyVars(" ~ .", data = x, fullRank=T)
+  trsf <- data.frame(predict(dmy, newdata = x))
+  x <- as.matrix(trsf)
+  
+  # Check for NA/NaN/Inf in the predictor matrix
+  if (any(!is.finite(x))) {
+    stop("NA/NaN/Inf values found in the predictor matrix for training data")
+  }
+  
+  y <- Surv(train$time_to_event, train$event_merged)
+  
+  # Fit the Lasso-Cox model using cross-validation
+  train.m <- cv.glmnet(x, y, family="cox", type.measure = "C", nfolds=5)
+  
+  # Predict the linear predictors (PI) from the Lasso-Cox model
+  coef_lasso <- as.data.frame(predict(train.m, s = "lambda.min", newx = x, type = "link", exact = TRUE))
+  train <- train %>% mutate(PI = as.matrix(coef_lasso)) 
+  
+  # Fit a Cox model on the penalized coefficients using coxph to extract the estimates
+  cox_model_train <- coxph(Surv(time_to_event, event_merged) ~ PI , data = train)
+    print(summary(cox_model_train))   # coefficeitn should be 1 (perfect calibration on train data)
+
+ # Store apparent performance metrics (discrimination, could also output calibration)
+  
+  c_stat_app[i,1] <- (summary(cox_model_train)$concordance)[1] #%>% round(3)
+  c_stat_app[i,2] <- (summary(cox_model_train)$concordance)[2] #%>% round(3)
+  c_stat_app[i,3] <- borough
+  c_stat_app[i,4] <- nrow(train)
+  c_stat_app[i,5] <- sum(train$event_merged)
+  c_stat_app[i,6] <- nrow(test)
+  c_stat_app[i,7] <- sum(test$event_merged)
+
+# Outer fold test-----------------------------------------------------------------------------------------
+  
+  # Prepare the test data for validation
+  x_test <- test %>% select(all_of(all_vars))
+  # dummify the data
+  dmy <- dummyVars(" ~ .", data = x_test, fullRank = T)
+  trsf <- data.frame(predict(dmy, newdata = x_test))
+  x <- as.matrix(trsf)
+  x_test <- as.matrix(x)
+    
+  y_test <- test %>% select(c(event_merged, time_to_event))
+  
+  # Check for NA/NaN/Inf in the predictor matrix
+  if (any(!is.finite(x_test))) {
+    stop("NA/NaN/Inf values found in the predictor matrix for test data")
+  }
+
+ # Predict the linear predictors (PI) from the Lasso-Cox model on the test set
+  coef_lasso_test <- as.data.frame(predict(train.m, s = "lambda.min", newx = x_test, type = "link", exact = TRUE))
+  test <- test %>% mutate(PI = as.matrix(coef_lasso_test)) 
+  cox_model_test <- coxph(Surv(time_to_event, event_merged) ~ PI , data = test, x= TRUE)
+
+ # Calibration
+
+ # Option 1
+ summ <- summary(cox_model_test)
+ cali_1 <- summ$coefficients[1]
+
+ # Option 2
+     x_test <- as.data.frame(x_test)
+     times <- c(2190) # 6 year prediction
+     y_surv <- 1 - with(test, Surv(time_to_event, event_merged))[,2]
+     surv_prob <- pec::predictSurvProb(cox_model_test, test, times)
+     calibration <- val.prob(p=surv_prob, y = y_surv, m=200, pl=F)
+
+     brier <- unname(calibration[11])
+     cali_2 <- unname(calibration[13])
+
+    # DCA
+    dca_pred_obs <- cbind(y_test,surv_prob) %>% as.data.frame() 
+    names(dca_pred_obs)[3] <- "pred"
+    dca_pred_obs$pred <- 1- dca_pred_obs$pred # probability of event = 1- surv prob
+    #dca_pred_obs$obs <- ifelse(dca_pred_obs$event_merged == 1 & dca_pred_obs$time_to_event < 2190, 1, 0) 
+    write.csv(dca_pred_obs, paste0("dca_pred_obs",i ,".csv"), row.names = FALSE) 
+    
+    dca_assessment  <-  dca(Surv(time_to_event,event_merged) ~ pred,
+                        data = dca_pred_obs,
+                         time = 2190,
+                        thresholds = seq(0, 1, 0.01)) %>% as_tibble() 
+    # Summarize net benefit
+    dca_assessment = dca_assessment %>%
+    group_by(variable, label, threshold)
+    
+    write.csv(dca_assessment, paste0("dca_assessment",i ,".csv"), row.names = FALSE) 
+
+  # Store external performance metrics
+  
+  c_stat_ext[i,1] <- (summary(cox_model_test)$concordance)[1] 
+  c_stat_ext[i,2] <- (summary(cox_model_test)$concordance)[2]
+  c_stat_ext[i,3] <- borough
+  c_stat_ext[i,4] <- nrow(train)
+  c_stat_ext[i,5] <- sum(train$event_merged)
+  c_stat_ext[i,6] <- nrow(test)
+  c_stat_ext[i,7] <- sum(test$event_merged)
+  c_stat_ext[i,8] <- cali_1  %>% round(3)
+  c_stat_ext[i,9] <- cali_2  %>% round(3)
+  c_stat_ext[i,10] <- brier 
+
+  
+}
+
+```
+### Print and save results
+ 
+ 
+```{r}
+
+print(c_stat_app)
+print(c_stat_ext)
+mean(c_stat_app$C_Cox)
+mean(c_stat_ext$C_Cox)
+
+write.csv(c_stat_app, "c_stat_app.csv")
+write.csv(c_stat_ext, "c_stat_ext.csv") 
+ 
+```
+
+
+
+### Plots DCA curve
+ 
+ 
+```{r}
+
+# Then plot DCA function
+
+csv_list1 <- read.csv("Downloads/dca_assessment1.csv")
+csv_list2 <- read.csv("Downloads/dca_assessment2.csv")
+csv_list3 <- read.csv("Downloads/dca_assessment3.csv")
+
+dca_all <- rbind(csv_list1, csv_list2) 
+dca_all <- rbind(dca_all, csv_list3) 
+head(dca_all)
+
+# Then plot DCA function
+
+ggplot(data=dca_all, aes(x = threshold, y = net_benefit, color = label)) +
+stat_smooth(method = "loess", se = TRUE, formula = "y ~ x") +
+coord_cartesian(ylim = c(-0.005, 1)) +
+scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits=c(0,0.5)) +
+labs(x = "Threshold Probability", y = "Net Benefit", color = "") +
+ theme_classic() +
+theme(legend.title = element_text(size=20),
+      legend.text = element_text(size = 15),
+      axis.text = element_text(size = 15),       # Enlarges tick labels
+      axis.title = element_text(size = 25),
+text = element_text( size =30)) 
+
+ # ggsave("overall_DCA_summary.png", height =5, width =5 )  # scale=0.5
+
+
+```
+  
+
+
