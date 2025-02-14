@@ -3,7 +3,7 @@ This repository provides the code used in the paper *"Development and Internal-E
 
 Steyerberg and Harrell recommend internal-external validation as an alternative to split-sample approaches, offering improved assessment of generalizability across subgroups or settings. In our case, data are split by geographical borough, with the model iteratively trained on a set of boroughs (derivation dataset) and validated on the excluded borough (validation dataset). The final model, developed on all available data, is considered internally-externally validated, providing coefficients for future external validation.
 
-Please refer to Steyerberg EW, Harrell FE. Prediction models need appropriate internal, internal-external, and external validation. J Clin Epidemiol. 2016;69:245-247. doi: 10.1016/j.jclinepi.2015.04.005 for further information on this statistical approach. 
+Please refer to Steyerberg EW, Harrell FE. Prediction models need appropriate internal, internal-external, and external validation. J Clin Epidemiol. 2016;69:245-247. doi: [10.1016/j.jclinepi.2015.04.005](https://pubmed.ncbi.nlm.nih.gov/25981519/) for further information on this statistical approach. 
 
 ### Data Sharing
 The data accessed by CRIS remain within an NHS firewall and governance is provided by a patient-led oversight committee. However, due to data sharing policy (see https://doi.org/10.1186/1471-244X-9-51 for futher details) we are unable to share the raw data. 
